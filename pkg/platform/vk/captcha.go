@@ -31,12 +31,11 @@ import (
 var (
 	deviceInfo = `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1080,"innerWidth":1920,"innerHeight":951,"devicePixelRatio":1,"language":"en-US","languages":["en-US","en"],"webdriver":false,"hardwareConcurrency":8,"notificationsPermission":"denied"}`
 
-	reCaptchaPowInput   = regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)             // Extracts PoW input from captcha HTML
-	reCaptchaDifficulty = regexp.MustCompile(`const\s+difficulty\s*=\s*(\d+)`)               // Extracts PoW difficulty from captcha HTML
-	reCaptchaWindowInit = regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?})\s*;`)          // Extracts captcha settings bootstrap JSON
-	reCaptchaScriptSrc  = regexp.MustCompile(`src="(https://[^"]+not_robot_captcha[^"]+)"`)  // Finds captcha JS bundle URL
-	reCaptchaDebugInfo  = regexp.MustCompile(`debug_info:(?:[^"]*\|\|)?"([a-fA-F0-9]{64})"`) // Extracts hardcoded debug_info constant from captcha JS
-	reCaptchaVersion    = regexp.MustCompile(`vkid/([0-9.]*)/not_robot_captcha\.js`)         // Extracts version of the captcha script
+	reCaptchaPowArgs    = regexp.MustCompile(`\}\("([^"]*)",\s*(\d+),\s*"[^"]*"\)\);\s*</script>`) // Extracts PoW input+difficulty from the IIFE invocation args in captcha HTML
+	reCaptchaWindowInit = regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?})\s*;`)                // Extracts captcha settings bootstrap JSON
+	reCaptchaScriptSrc  = regexp.MustCompile(`src="(https://[^"]+not_robot_captcha[^"]+)"`)        // Finds captcha JS bundle URL
+	reCaptchaDebugInfo  = regexp.MustCompile(`debug_info:(?:[^"]*\|\|)?"([a-fA-F0-9]{64})"`)       // Extracts hardcoded debug_info constant from captcha JS
+	reCaptchaVersion    = regexp.MustCompile(`vkid/([0-9.]*)/not_robot_captcha\.js`)               // Extracts version of the captcha script
 
 	errCaptchaRateLimit = errors.New("captcha session rate limit reached") // Marks exhausted captcha sessions
 
@@ -284,25 +283,17 @@ func parseCaptchaPage(html string) (*captchaPage, error) {
 
 	page.ScriptURL = match[1]
 
-	if match := reCaptchaPowInput.FindStringSubmatch(html); len(match) >= 2 {
+	if match := reCaptchaPowArgs.FindStringSubmatch(html); len(match) >= 3 {
 		page.PowInput = match[1]
+
+		difficulty, err := strconv.Atoi(match[2])
+		if err != nil || difficulty <= 0 {
+			return nil, fmt.Errorf("invalid captcha difficulty %q", match[2])
+		}
+
+		page.PowDifficulty = difficulty
 	}
 
-	if page.PowInput == "" {
-		return page, nil
-	}
-
-	match = reCaptchaDifficulty.FindStringSubmatch(html)
-	if len(match) < 2 {
-		return nil, errors.New("captcha difficulty const not found")
-	}
-
-	difficulty, err := strconv.Atoi(match[1])
-	if err != nil || difficulty <= 0 {
-		return nil, fmt.Errorf("invalid captcha difficulty %q", match[1])
-	}
-
-	page.PowDifficulty = difficulty
 	return page, nil
 }
 
