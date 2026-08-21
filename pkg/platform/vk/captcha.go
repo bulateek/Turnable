@@ -31,16 +31,23 @@ import (
 var (
 	deviceInfo = `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1080,"innerWidth":1920,"innerHeight":951,"devicePixelRatio":1,"language":"en-US","languages":["en-US","en"],"webdriver":false,"hardwareConcurrency":8,"notificationsPermission":"denied"}`
 
-	reCaptchaPowArgs    = regexp.MustCompile(`}\("([^"]*)",\s*(\d+),\s*"[^"]*"\)\);\s*</script>`) // Extracts PoW input and difficulty from captcha HTML
-	reCaptchaWindowInit = regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?})\s*;`)               // Extracts captcha settings bootstrap JSON
-	reCaptchaScriptSrc  = regexp.MustCompile(`src="(https://[^"]+not_robot_captcha[^"]+)"`)       // Finds captcha JS bundle URL
-	reCaptchaDebugInfo  = regexp.MustCompile(`debug_info:(?:[^"]*\|\|)?"([a-fA-F0-9]{64})"`)      // Extracts hardcoded debug_info constant from captcha JS
-	reCaptchaVersion    = regexp.MustCompile(`vkid/([0-9.]*)/not_robot_captcha\.js`)              // Extracts version of the captcha script
+	// reCaptchaPowArgs and rePowPrefix rely on the PoW solver being a self-invoking
+	// obfuscated function whose *call site* (input, difficulty, error label, and the
+	// literal prefix concatenated onto the base64 envelope) stays structurally stable
+	// across releases even though internal variable names are re-randomized every time.
+	reCaptchaPowArgs    = regexp.MustCompile(`}\("([^"]*)",\s*(\d+),\s*"[^"]*"\)\);\s*</script>`)
+	rePowPrefix         = regexp.MustCompile(`captchaPowResult["'\]]{0,3}\s*=\s*["']([A-Za-z0-9._-]{0,8})["']\s*\+`)
+	reCaptchaWindowInit = regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?})\s*;`) // Extracts captcha settings bootstrap JSON (absent on the BFF-rendered page)
+	// reCaptchaVKGlobal + reCaptchaDebugUUID replace the old approach of fetching a
+	// separate not_robot_captcha.js bundle to find a hardcoded debug_info constant:
+	// that script URL no longer appears on the BFF-rendered captcha page at all, but
+	// a UUID-shaped value under some randomized key inside window.vk still is.
+	reCaptchaVKGlobal  = regexp.MustCompile(`window\.vk\s*=\s*\{`)
+	reCaptchaDebugUUID = regexp.MustCompile(`[A-Za-z_$][\w$]*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"`)
 
 	errCaptchaRateLimit = errors.New("captcha session rate limit reached") // Marks exhausted captcha sessions
 
-	captchaAPIVersion    = "5.131"    // last known version of the captcha API
-	captchaScriptVersion = "1.1.1394" // last known version of the captcha script
+	captchaAPIVersion = "5.131" // last known version of the captcha API
 )
 
 // captchaInit represents window.init JSON object with captcha initialization data
@@ -56,16 +63,31 @@ type captchaInitData struct {
 
 // captchaInitSetting represents an available captcha setting
 type captchaInitSetting struct {
-	Type     string `json:"type"`
-	Settings string `json:"settings"`
+	Type        string `json:"type"`
+	Settings    string `json:"settings"`
+	SettingsKey string `json:"settings_key"`
+}
+
+// contentRef returns the value to send back as captcha_settings, preferring
+// settings_key (an opaque server-side reference) over the inline settings blob
+// when the API provided both.
+func (s captchaInitSetting) contentRef() string {
+	if v := strings.TrimSpace(s.SettingsKey); v != "" {
+		return v
+	}
+	return strings.TrimSpace(s.Settings)
 }
 
 // captchaPage stores captcha metadata extracted from the challenge page
 type captchaPage struct {
 	PowInput      string
 	PowDifficulty int
-	ScriptURL     string
-	Init          *captchaInit
+	PowPrefix     string
+	DebugInfo     string
+	// Init is nil when window.init isn't present on the page (BFF-rendered captcha):
+	// the caller must then fall back to captchaNotRobot.initSession to learn the
+	// challenge type instead of reading it out of the static HTML.
+	Init *captchaInit
 }
 
 // captchaCheck stores the result of a captcha verification attempt
@@ -145,28 +167,21 @@ func (V *Handler) solveCaptcha(ctx context.Context, apiErr vkAPIError) (string, 
 		return "", err
 	}
 
-	if page.PowInput == "" {
-		return "", errors.New("failed to find PoW settings")
-	}
-
-	sliderSettings := ""
-	for _, setting := range page.Init.Data.CaptchaSettings {
-		if setting.Type == "slider" {
-			sliderSettings = setting.Settings
-		}
-	}
-
-	if page.Init.Data.ShowCaptchaType == "slider" && sliderSettings == "" {
-		return "", errors.New("failed to find slider captcha settings")
+	showType, sliderSettings, err := V.resolveCaptchaChallenge(ctx, apiErr, page)
+	if err != nil {
+		return "", err
 	}
 
 	slog.Debug("vk captcha solving pow", "difficulty", page.PowDifficulty)
 
-	hash, nonce := solveCaptchaPoW(page.PowInput, page.PowDifficulty)
-	if hash == "" {
+	powHash, nonce := solveCaptchaPoW(page.PowInput, page.PowDifficulty)
+	if powHash == "" {
 		return "", errors.New("captcha pow failed")
 	}
-	hash = fmt.Sprintf("v2.%s", base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"hash":"%s","nonce":%d}`, hash, nonce))))
+	hash, err := V.buildPowEnvelope(page.PowPrefix, powHash, nonce)
+	if err != nil {
+		return "", fmt.Errorf("captcha pow envelope: %w", err)
+	}
 	slog.Debug("vk captcha pow solved")
 
 	base := common.NewValues(
@@ -188,27 +203,15 @@ func (V *Handler) solveCaptcha(ctx context.Context, apiErr vkAPIError) (string, 
 
 	browserFP := hex.EncodeToString(b)
 
-	if m := reCaptchaVersion.FindSubmatch([]byte(page.ScriptURL)); len(m) > 1 {
-		if string(m[1]) != captchaScriptVersion {
-			slog.Warn("vk captcha script version changed", "last_known", captchaScriptVersion, "latest", string(m[1]))
-		}
-	}
-
-	debugInfo, err := V.fetchDebugInfo(ctx, page.ScriptURL)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch debug info: %w", err)
-	}
-
 	var token string
-	showType := page.Init.Data.ShowCaptchaType
 	for {
 		slog.Info("vk captcha solving", "show_type", showType)
 
 		switch showType {
 		case "slider":
-			token, err = V.solveSliderCaptcha(ctx, apiErr.SessionToken, apiErr.AdFP, browserFP, hash, sliderSettings, debugInfo)
+			token, err = V.solveSliderCaptcha(ctx, apiErr.SessionToken, apiErr.AdFP, browserFP, hash, sliderSettings, page.DebugInfo)
 		case "checkbox":
-			token, err = V.solveCheckboxCaptcha(ctx, apiErr.SessionToken, apiErr.AdFP, browserFP, hash, debugInfo)
+			token, err = V.solveCheckboxCaptcha(ctx, apiErr.SessionToken, apiErr.AdFP, browserFP, hash, page.DebugInfo)
 		default:
 			return "", fmt.Errorf("unsupported captcha type: %s", showType)
 		}
@@ -229,24 +232,63 @@ func (V *Handler) solveCaptcha(ctx context.Context, apiErr vkAPIError) (string, 
 	return token, nil
 }
 
-// fetchDebugInfo fetches the captcha JS and extracts the hardcoded debug_info constant, with caching.
-func (V *Handler) fetchDebugInfo(ctx context.Context, scriptURL string) (string, error) {
-	body, err := V.postVKFormRaw(ctx, http.MethodGet, scriptURL, nil, map[string]string{
-		"Accept":  "text/javascript,*/*",
-		"Referer": "https://id.vk.com/",
-	})
+// resolveCaptchaChallenge returns the challenge type and, for a slider challenge,
+// the captcha_settings value to request its content with. When window.init was
+// present on the page it's read from there directly, matching what the real widget
+// does to avoid an extra, telltale request. On the BFF-rendered page window.init is
+// absent, so the widget (and we) call captchaNotRobot.initSession instead.
+func (V *Handler) resolveCaptchaChallenge(ctx context.Context, apiErr vkAPIError, page *captchaPage) (string, string, error) {
+	if page.Init != nil && page.Init.Data.ShowCaptchaType != "" {
+		showType := page.Init.Data.ShowCaptchaType
+		settings := ""
+		for _, setting := range page.Init.Data.CaptchaSettings {
+			if setting.Type == "slider" {
+				settings = setting.contentRef()
+			}
+		}
+		if showType == "slider" && settings == "" {
+			return "", "", errors.New("failed to find slider captcha settings")
+		}
+		slog.Debug("vk captcha challenge from window.init", "show_type", showType)
+		return showType, settings, nil
+	}
+
+	resp, err := V.captchaRequest(ctx, "captchaNotRobot.initSession", common.NewValues(
+		"session_token", apiErr.SessionToken,
+		"domain", "vk.com",
+		"lang", "0",
+	))
 	if err != nil {
-		return "", err
+		return "", "", fmt.Errorf("captcha initSession failed: %w", err)
 	}
 
-	m := reCaptchaDebugInfo.FindSubmatch(body)
-	if len(m) < 2 {
-		return "", errors.New("match not found")
+	respMap, _ := resp["response"].(map[string]any)
+	showType := common.StringifyAny(respMap["show_captcha_type"])
+	settings := parseCaptchaContentSettings(respMap["content_settings"])
+	if showType == "slider" && settings == "" {
+		return "", "", errors.New("failed to find slider captcha settings")
 	}
+	slog.Debug("vk captcha challenge from initSession", "show_type", showType)
+	return showType, settings, nil
+}
 
-	v := string(m[1])
-	slog.Debug("captcha debug_info fetched", "url", scriptURL, "value", v)
-	return v, nil
+// parseCaptchaContentSettings extracts the slider captcha_settings value out of an
+// initSession response's content_settings array.
+func parseCaptchaContentSettings(raw any) string {
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return ""
+	}
+	var settings []captchaInitSetting
+	if json.Unmarshal(data, &settings) != nil {
+		return ""
+	}
+	for _, setting := range settings {
+		if setting.Type == "slider" {
+			return setting.contentRef()
+		}
+	}
+	return ""
 }
 
 // fetchCaptchaHTML downloads the captcha HTML page from redirect URI
@@ -263,42 +305,96 @@ func (V *Handler) fetchCaptchaHTML(ctx context.Context, redirectURI string) (str
 	return string(body), nil
 }
 
-// parseCaptchaPage extracts captcha metadata from HTML
+// parseCaptchaPage extracts captcha metadata from HTML. window.init is optional:
+// it's present on the classic server-rendered captcha page but absent on the newer
+// BFF-rendered one, where the caller must fall back to captchaNotRobot.initSession.
 func parseCaptchaPage(html string) (*captchaPage, error) {
 	page := &captchaPage{}
 
-	match := reCaptchaWindowInit.FindStringSubmatch(html)
-	if len(match) < 2 {
-		return nil, errors.New("captcha init json not found")
+	if match := reCaptchaWindowInit.FindStringSubmatch(html); len(match) >= 2 {
+		var init captchaInit
+		if json.Unmarshal([]byte(match[1]), &init) == nil {
+			page.Init = &init
+		}
 	}
 
-	var init captchaInit
-	_ = json.Unmarshal([]byte(match[1]), &init)
-	page.Init = &init
-
-	match = reCaptchaScriptSrc.FindStringSubmatch(html)
-	if len(match) < 2 {
-		return nil, errors.New("captcha script url not found")
+	match := reCaptchaPowArgs.FindStringSubmatch(html)
+	if len(match) < 3 {
+		return nil, errors.New("captcha pow args not found")
 	}
 
-	page.ScriptURL = match[1]
+	page.PowInput = match[1]
+	difficulty, err := strconv.Atoi(match[2])
+	if err != nil || difficulty <= 0 {
+		return nil, fmt.Errorf("invalid captcha difficulty %q", match[2])
+	}
+	page.PowDifficulty = difficulty
 
-	if match := reCaptchaPowArgs.FindStringSubmatch(html); len(match) >= 3 {
-		page.PowInput = match[1]
+	prefixMatch := rePowPrefix.FindStringSubmatch(html)
+	if len(prefixMatch) < 2 {
+		return nil, errors.New("captcha pow envelope prefix not found")
+	}
+	page.PowPrefix = prefixMatch[1]
 
-		if page.PowInput == "" {
-			return page, nil
-		}
-
-		difficulty, err := strconv.Atoi(match[2])
-		if err != nil || difficulty <= 0 {
-			return nil, fmt.Errorf("invalid captcha difficulty %q", match[1])
-		}
-
-		page.PowDifficulty = difficulty
+	page.DebugInfo = parseCaptchaDebugInfo(html)
+	if page.DebugInfo == "" {
+		return nil, errors.New("captcha debug_info not found on page")
 	}
 
 	return page, nil
+}
+
+// parseCaptchaDebugInfo extracts the debug_info value from window.vk, which holds
+// it under a randomized key as a bare UUID string. This replaced fetching a
+// separate not_robot_captcha.js bundle, which no longer appears on the page.
+func parseCaptchaDebugInfo(html string) string {
+	loc := reCaptchaVKGlobal.FindStringIndex(html)
+	if loc == nil {
+		return ""
+	}
+
+	block := balancedJSONObject(html[loc[1]-1:])
+	if block == "" {
+		return ""
+	}
+
+	found := reCaptchaDebugUUID.FindAllStringSubmatch(block, -1)
+	if len(found) == 0 {
+		return ""
+	}
+	if len(found) > 1 {
+		slog.Warn("vk captcha window.vk holds multiple uuid values, debug_info may be ambiguous", "count", len(found))
+	}
+
+	return found[0][1]
+}
+
+// balancedJSONObject returns the first brace-balanced {...} substring, accounting
+// for braces inside quoted strings.
+func balancedJSONObject(s string) string {
+	depth, inStr, esc := 0, false, false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case inStr && esc:
+			esc = false
+		case inStr && c == '\\':
+			esc = true
+		case inStr && c == '"':
+			inStr = false
+		case inStr:
+		case c == '"':
+			inStr = true
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+			if depth == 0 {
+				return s[:i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // captchaRequest performs captcha API requests
